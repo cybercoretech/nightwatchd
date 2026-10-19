@@ -1,0 +1,26 @@
+[package]
+name = "nightwatchd"
+version = "0.1.0"
+edition = "2024"
+description = "Nightwatch gateway: lets the Nightwatch phone app watch and operate this host's Cybercore services over the tailnet (Cybercore Tech)"
+license = "MIT"
+repository = "https://github.com/cybercoretech/nightwatchd"
+
+[dependencies]
+anyhow = "1.0"
+axum = "0.7"
+dirs = "6"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "time", "sync", "net", "signal", "fs"] }
+toml = "0.8"
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+
+[profile.release]
+strip = true
+lto = "thin"

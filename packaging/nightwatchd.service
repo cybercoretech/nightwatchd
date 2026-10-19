@@ -1,0 +1,26 @@
+[Unit]
+Description=nightwatchd — Nightwatch phone gateway (127.0.0.1:8769, published by tailscale serve)
+Documentation=https://github.com/cybercoretech/nightwatchd
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/nightwatchd serve
+Restart=on-failure
+RestartSec=3
+# It only reads the services' local-token files, its own config and the
+# journal, and writes its tokens/push registrations and alert log. No
+# setuid helpers here (unlike DaemonHall/Holodrive), so the sandbox is on.
+# install.sh creates both writable directories first: a missing
+# ReadWritePaths= target fails the unit with 226/NAMESPACE.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/nightwatch %h/.local/state/nightwatch
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=default.target
