@@ -74,6 +74,7 @@ and nightwatchd themselves. Add more with `[policy] protected_units`.
 | `GET /push` | `{enabled, endpoint}` for this device. |
 | `POST /push` | Body `{"endpoint": "https://ntfy.../upXXXX?up=1"}`. The host must be listed in `[push] allowed_hosts`. There's one endpoint per device token; registering again replaces it. |
 | `DELETE /push` | Stops pushes to this device. |
+| `POST /push/test` | Sends `{"type": "test", "host"}` to this device's endpoint, to check the whole path. The app shows its own fixed text for it. |
 
 Each new alert of `warn` or `crit` is POSTed to every endpoint as
 `{"type": "alert", "host", "id", "severity", "title"}`, with the ntfy `Priority`

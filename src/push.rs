@@ -120,6 +120,28 @@ pub fn message(alert: &Alert, host: &str) -> serde_json::Value {
     })
 }
 
+/// Sends `{"type": "test", "host"}` to one phone's endpoint, so the user can
+/// check the whole path (gateway → ntfy → phone) without waiting for an
+/// alert. The app shows its own fixed text for it, never the payload.
+pub async fn send_test(registry: &Registry, token_id: &str, host: &str) -> Result<(), String> {
+    let reg = registry
+        .get(token_id)
+        .ok_or("this phone has no push endpoint registered yet")?;
+    registry.check(&reg.endpoint)?;
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?
+        .post(&reg.endpoint)
+        .header("Priority", "3")
+        .body(json!({ "type": "test", "host": host }).to_string())
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map(|_| ())
+        .map_err(|e| format!("the push server refused it: {e}"))
+}
+
 /// Forward new alerts to every registered phone.
 pub async fn run(alerts: Arc<Alerts>, registry: Arc<Registry>, tokens: Arc<Tokens>, host: String) {
     let http = reqwest::Client::builder()

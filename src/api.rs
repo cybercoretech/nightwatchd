@@ -70,6 +70,7 @@ pub fn router(app: Shared) -> Router {
         .route("/v1/alerts", get(alerts))
         .route("/v1/alerts/ack", post(alerts_ack))
         .route("/v1/push", get(push_get).post(push_register).delete(push_unregister))
+        .route("/v1/push/test", post(push_test))
         // Mission Control
         .route("/v1/mission", get(mission_project))
         .route("/v1/mission/agents", get(mission_agents))
@@ -477,6 +478,13 @@ async fn push_register(State(app): State<Shared>, Extension(g): Extension<Grant>
     }
 }
 
+async fn push_test(State(app): State<Shared>, Extension(g): Extension<Grant>) -> Response {
+    match crate::push::send_test(&app.push, &g.id, &app.host).await {
+        Ok(()) => Json(json!({ "ok": true, "message": "test push sent" })).into_response(),
+        Err(m) => err(StatusCode::UNPROCESSABLE_ENTITY, m),
+    }
+}
+
 async fn push_unregister(State(app): State<Shared>, Extension(g): Extension<Grant>) -> Json<Value> {
     Json(json!({ "ok": true, "removed": app.push.unregister(&g.id) }))
 }
@@ -596,6 +604,10 @@ mod tests {
         assert_eq!(call(&r, "POST", "/v1/push", Some(&read), Some(good)).await.0, StatusCode::OK);
         let (_, v) = call(&r, "GET", "/v1/push", Some(&read), None).await;
         assert_eq!(v["endpoint"], "https://ntfy.test/upABC?up=1");
+        // ntfy.test doesn't resolve: the test push reports the failure.
+        let (s, v) = call(&r, "POST", "/v1/push/test", Some(&read), None).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(v["message"].as_str().unwrap().contains("refused"));
         let (_, v) = call(&r, "GET", "/v1/mission", Some(&read), None).await;
         assert!(v["message"].as_str().unwrap().contains("turned off"));
     }
