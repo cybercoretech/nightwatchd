@@ -25,7 +25,7 @@ fn usage() -> ! {
         "nightwatchd — Nightwatch's gateway to this host's Cybercore services\n\n\
          USAGE:\n  \
          nightwatchd [serve] [--config FILE]   run the gateway\n  \
-         nightwatchd token add NAME [--operate]   new device token (read-only unless --operate)\n  \
+         nightwatchd token add NAME [--operate] [--qr]   new device token (read-only unless --operate;\n                                         --qr also prints a pairing link + QR code)\n  \
          nightwatchd token list\n  \
          nightwatchd token revoke ID\n  \
          nightwatchd check [--config FILE]   test the connection to each service\n\n\
@@ -66,9 +66,10 @@ fn token(rest: &[String]) {
     match rest.first().map(String::as_str) {
         Some("add") => {
             let operate = rest.iter().any(|a| a == "--operate");
+            let qr = rest.iter().any(|a| a == "--qr");
             let name: Vec<&str> = rest[1..]
                 .iter()
-                .filter(|a| *a != "--operate")
+                .filter(|a| *a != "--operate" && *a != "--qr")
                 .map(String::as_str)
                 .collect();
             let (t, secret) = store.create(&name.join(" "), operate).unwrap_or_else(|e| die(e));
@@ -79,6 +80,9 @@ fn token(rest: &[String]) {
                 t.id,
                 t.id
             );
+            if qr {
+                pairing(&secret);
+            }
         }
         Some("list") => {
             let list = store.list();
@@ -105,6 +109,40 @@ fn token(rest: &[String]) {
         }
         _ => usage(),
     }
+}
+
+/// Prints a `nightwatch://add` link (and a QR code when `qrencode` is
+/// installed) that pre-fills the app's Add host screen.
+fn pairing(secret: &str) {
+    let cfg = config::Config::load(&config::default_path()).unwrap_or_default();
+    let port = cfg.listen.rsplit(':').next().unwrap_or("8769").to_string();
+    let Some(dns) = tailnet_name() else {
+        eprintln!("\n(no pairing link: couldn't read this host's tailnet name from `tailscale status`)");
+        return;
+    };
+    let mut link = reqwest::Url::parse("nightwatch://add").expect("static url");
+    link.query_pairs_mut()
+        .append_pair("url", &format!("http://{dns}:{port}"))
+        .append_pair("token", secret)
+        .append_pair("name", &cfg.host_label);
+    println!("\nPairing link (opens Nightwatch with this host filled in):\n\n  {link}\n");
+    match std::process::Command::new("qrencode")
+        .args(["-t", "ANSIUTF8", "-m", "2", link.as_str()])
+        .status()
+    {
+        Ok(s) if s.success() => println!("\nScan it with the phone's camera, then tap Connect."),
+        _ => println!("(install qrencode to get a QR code here)"),
+    }
+}
+
+fn tailnet_name() -> Option<String> {
+    let out = std::process::Command::new("tailscale")
+        .args(["status", "--json"])
+        .output()
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let name = v.get("Self")?.get("DNSName")?.as_str()?.trim_end_matches('.');
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 fn ago(t: u64) -> String {
