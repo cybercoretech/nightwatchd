@@ -1440,7 +1440,7 @@ dependencies = [
 [[package]]
 name = "warnflare"
 version = "0.1.0"
-source = "git+https://github.com/cybercoretech/warnflare?rev=4d05dd21a37650178f3ffb562999689b11f187e9#4d05dd21a37650178f3ffb562999689b11f187e9"
+source = "git+https://github.com/cybercoretech/warnflare?tag=v0.1.0#c8690f40e7c1c5104203f238881780c279b07899"
 dependencies = [
  "regex",
  "serde",
