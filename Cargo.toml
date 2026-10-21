@@ -17,6 +17,9 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "time", "sync", "net", "signal", "fs"] }
 toml = "0.8"
+libc = "0.2"
+# Alert rules (failed/re-failed units, freshness, journal, webhook, quiet hours).
+warnflare = { git = "https://github.com/cybercoretech/warnflare", rev = "4d05dd21a37650178f3ffb562999689b11f187e9" }
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }

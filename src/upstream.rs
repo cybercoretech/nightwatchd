@@ -79,7 +79,11 @@ impl Upstream {
 
     /// `segments` are URL-encoded one by one, so a unit id like
     /// `user:foo@bar.service` can't escape its path segment.
-    pub fn url(&self, segments: &[&str], query: &[(&str, String)]) -> Result<reqwest::Url, UpError> {
+    pub fn url(
+        &self,
+        segments: &[&str],
+        query: &[(&str, String)],
+    ) -> Result<reqwest::Url, UpError> {
         let mut url = reqwest::Url::parse(&self.cfg.url)
             .map_err(|e| UpError::Unreachable(self.name, format!("bad url in config: {e}")))?;
         url.path_segments_mut()
@@ -92,7 +96,12 @@ impl Upstream {
         Ok(url)
     }
 
-    fn request(&self, method: reqwest::Method, url: reqwest::Url, actor: Option<&str>) -> reqwest::RequestBuilder {
+    fn request(
+        &self,
+        method: reqwest::Method,
+        url: reqwest::Url,
+        actor: Option<&str>,
+    ) -> reqwest::RequestBuilder {
         let mut rb = self.http.request(method, url);
         if let Some(t) = self.token() {
             rb = rb.bearer_auth(t);
@@ -121,7 +130,8 @@ impl Upstream {
             .send()
             .await
             .map_err(|e| UpError::Unreachable(self.name, short(&e)))?;
-        let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let status =
+            StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         if status.is_success() {
             return Ok(resp);
         }
@@ -139,7 +149,11 @@ impl Upstream {
         Err(UpError::Status(status, msg))
     }
 
-    pub async fn get_json(&self, segments: &[&str], query: &[(&str, String)]) -> Result<Value, UpError> {
+    pub async fn get_json(
+        &self,
+        segments: &[&str],
+        query: &[(&str, String)],
+    ) -> Result<Value, UpError> {
         let url = self.url(segments, query)?;
         let resp = self.send(reqwest::Method::GET, url, None, None).await?;
         resp.json()
@@ -156,7 +170,12 @@ impl Upstream {
     }
 
     /// POST and return the body as JSON when it is JSON, else as a string.
-    pub async fn post(&self, segments: &[&str], body: Option<&Value>, actor: &str) -> Result<Value, UpError> {
+    pub async fn post(
+        &self,
+        segments: &[&str],
+        body: Option<&Value>,
+        actor: &str,
+    ) -> Result<Value, UpError> {
         let url = self.url(segments, &[])?;
         let resp = self
             .send(reqwest::Method::POST, url, body, Some(actor))
@@ -168,7 +187,10 @@ impl Upstream {
     /// Is it up at all? A cheap GET that every service serves.
     pub async fn ping(&self, segments: &[&str]) -> bool {
         match self.url(segments, &[]) {
-            Ok(url) => self.send(reqwest::Method::GET, url, None, None).await.is_ok(),
+            Ok(url) => self
+                .send(reqwest::Method::GET, url, None, None)
+                .await
+                .is_ok(),
             Err(_) => false,
         }
     }
@@ -218,19 +240,32 @@ mod tests {
 
     #[test]
     fn path_segments_are_encoded() {
-        let u = up().url(&["api", "unit", "user:a/../b@x.service", "action", "stop"], &[]).unwrap();
+        let u = up()
+            .url(
+                &["api", "unit", "user:a/../b@x.service", "action", "stop"],
+                &[],
+            )
+            .unwrap();
         assert_eq!(
             u.as_str(),
             "http://127.0.0.1:8767/api/unit/user:a%2F..%2Fb@x.service/action/stop"
         );
-        let u = up().url(&["api", "logs"], &[("unit", "a b&c".into())]).unwrap();
+        let u = up()
+            .url(&["api", "logs"], &[("unit", "a b&c".into())])
+            .unwrap();
         assert_eq!(u.as_str(), "http://127.0.0.1:8767/api/logs?unit=a+b%26c");
     }
 
     #[test]
     fn error_bodies_become_messages() {
-        assert_eq!(message_of(r#"{"ok":false,"message":"nope"}"#).as_deref(), Some("nope"));
-        assert_eq!(message_of("not a watched unit").as_deref(), Some("not a watched unit"));
+        assert_eq!(
+            message_of(r#"{"ok":false,"message":"nope"}"#).as_deref(),
+            Some("nope")
+        );
+        assert_eq!(
+            message_of("not a watched unit").as_deref(),
+            Some("not a watched unit")
+        );
         assert_eq!(message_of("  "), None);
     }
 }

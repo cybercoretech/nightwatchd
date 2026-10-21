@@ -72,11 +72,17 @@ fn token(rest: &[String]) {
                 .filter(|a| *a != "--operate" && *a != "--qr")
                 .map(String::as_str)
                 .collect();
-            let (t, secret) = store.create(&name.join(" "), operate).unwrap_or_else(|e| die(e));
+            let (t, secret) = store
+                .create(&name.join(" "), operate)
+                .unwrap_or_else(|e| die(e));
             println!(
                 "token for {:?} ({}), id {}:\n\n  {secret}\n\nShown once; it isn't stored. Enter it in Nightwatch on the phone.\nRevoke with `nightwatchd token revoke {}`.",
                 t.name,
-                if t.operate { "read + operate" } else { "read-only" },
+                if t.operate {
+                    "read + operate"
+                } else {
+                    "read-only"
+                },
                 t.id,
                 t.id
             );
@@ -94,7 +100,11 @@ fn token(rest: &[String]) {
                     "{}  {:<24} {:<14} last used {}",
                     t.id,
                     t.name,
-                    if t.operate { "read + operate" } else { "read-only" },
+                    if t.operate {
+                        "read + operate"
+                    } else {
+                        "read-only"
+                    },
                     t.last_used.map(ago).unwrap_or_else(|| "never".into())
                 );
             }
@@ -117,7 +127,9 @@ fn pairing(secret: &str) {
     let cfg = config::Config::load(&config::default_path()).unwrap_or_default();
     let port = cfg.listen.rsplit(':').next().unwrap_or("8769").to_string();
     let Some(dns) = tailnet_name() else {
-        eprintln!("\n(no pairing link: couldn't read this host's tailnet name from `tailscale status`)");
+        eprintln!(
+            "\n(no pairing link: couldn't read this host's tailnet name from `tailscale status`)"
+        );
         return;
     };
     let mut link = reqwest::Url::parse("nightwatch://add").expect("static url");
@@ -141,7 +153,11 @@ fn tailnet_name() -> Option<String> {
         .output()
         .ok()?;
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    let name = v.get("Self")?.get("DNSName")?.as_str()?.trim_end_matches('.');
+    let name = v
+        .get("Self")?
+        .get("DNSName")?
+        .as_str()?
+        .trim_end_matches('.');
     (!name.is_empty()).then(|| name.to_string())
 }
 
@@ -169,13 +185,21 @@ async fn check(config_path: PathBuf) {
     for (u, path, file) in [
         (&dh, &["api", "units"][..], &cfg.daemonhall.token_file),
         (&ds, &["api", "summary"][..], &cfg.dockspace.token_file),
-        (&deck, &["cyberdeck", "api", "state"][..], &cfg.cyberdeck.token_file),
+        (
+            &deck,
+            &["cyberdeck", "api", "state"][..],
+            &cfg.cyberdeck.token_file,
+        ),
     ] {
         if !u.enabled() {
             println!("{:<11} off", u.name);
             continue;
         }
-        let token = if std::fs::metadata(file).is_ok() { "token ok" } else { "NO TOKEN FILE" };
+        let token = if std::fs::metadata(file).is_ok() {
+            "token ok"
+        } else {
+            "NO TOKEN FILE"
+        };
         let reach = match u.get_json(path, &[]).await {
             Ok(_) => "answering".to_string(),
             Err(e) => e.message(),
@@ -183,7 +207,11 @@ async fn check(config_path: PathBuf) {
         println!("{:<11} {reach}; {token} ({})", u.name, file.display());
     }
     let m = mission::Mission::new(&cfg.mission);
-    println!("{:<11} {}", "mission", if m.enabled() { "configured" } else { "off" });
+    println!(
+        "{:<11} {}",
+        "mission",
+        if m.enabled() { "configured" } else { "off" }
+    );
     println!(
         "{:<11} {}",
         "push",
@@ -195,32 +223,114 @@ async fn check(config_path: PathBuf) {
     );
 }
 
+/// Optional Warnflare rules in `~/.config/nightwatch/warnflare.toml`. A file
+/// that exists but doesn't validate stops startup: better than a silent
+/// watcher that never fires.
+fn load_warnflare() -> warnflare::config::Config {
+    let path = config::dir().join("warnflare.toml");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => warnflare::config::Config::from_toml(&text)
+            .unwrap_or_else(|e| die(format!("{}: {e}", path.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => warnflare::config::Config::default(),
+        Err(e) => die(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Read a token file, refusing one other users could read.
+fn read_secret(path: &str) -> Result<String, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let p = match path.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir().unwrap_or_default().join(rest),
+        None => PathBuf::from(path),
+    };
+    let meta = std::fs::metadata(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+    if meta.permissions().mode() & 0o077 != 0 {
+        return Err(format!(
+            "{} must not be readable by others (chmod 600)",
+            p.display()
+        ));
+    }
+    let token = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+    let token = token.trim().to_string();
+    if token.len() < 24 {
+        return Err(format!("{}: token too short (need 24+ chars)", p.display()));
+    }
+    Ok(token)
+}
+
 async fn serve(config_path: PathBuf) {
     let cfg = config::Config::load(&config_path).unwrap_or_else(|e| die(e));
     let (dh, ds, deck) = upstreams(&cfg);
     let dh = Arc::new(dh);
     let ds = Arc::new(ds);
     let tokens = Arc::new(tokens::Store::open(tokens::default_path()));
-    let alerts = Arc::new(alerts::Store::open(config::state_dir().join("alerts.jsonl")));
-    let push = Arc::new(push::Registry::open(push::default_path(), cfg.push.allowed_hosts.clone()));
+    let alerts = Arc::new(alerts::Store::open(
+        config::state_dir().join("alerts.jsonl"),
+    ));
+    let push = Arc::new(push::Registry::open(
+        push::default_path(),
+        cfg.push.allowed_hosts.clone(),
+    ));
     let (stop_tx, stopping) = tokio::sync::watch::channel(false);
 
+    let wf = load_warnflare();
+    let webhook_token = wf
+        .webhook
+        .as_ref()
+        .map(|w| read_secret(&w.token_file).unwrap_or_else(|e| die(e)));
     if cfg.alerts.enabled {
         let every = Duration::from_secs(cfg.alerts.poll_secs.max(5));
         if dh.enabled() {
-            tokio::spawn(alerts::watch_daemonhall(alerts.clone(), dh.clone(), every));
+            tokio::spawn(alerts::watch_daemonhall(
+                alerts.clone(),
+                dh.clone(),
+                every,
+                wf.ignore_units.clone(),
+            ));
+        }
+        if !wf.freshness.is_empty() {
+            tokio::spawn(alerts::watch_freshness(
+                alerts.clone(),
+                wf.freshness.clone(),
+                Duration::from_secs(300),
+            ));
+        }
+        if !wf.journal.is_empty() {
+            // Validated by load_warnflare, so this can't fail here.
+            let rules = Arc::new(
+                warnflare::journal::JournalRules::new(wf.journal.clone())
+                    .unwrap_or_else(|e| die(e)),
+            );
+            tokio::spawn(alerts::watch_journal(alerts.clone(), rules.clone(), false));
+            tokio::spawn(alerts::watch_journal(alerts.clone(), rules, true));
         }
         if ds.enabled() {
-            tokio::spawn(alerts::watch_dockspace(alerts.clone(), ds.clone(), every * 4));
+            tokio::spawn(alerts::watch_dockspace(
+                alerts.clone(),
+                ds.clone(),
+                every * 4,
+            ));
         }
         if !cfg.alerts.argus_events.is_empty() {
-            tokio::spawn(alerts::watch_argus(alerts.clone(), cfg.alerts.argus_events.clone().into()));
+            tokio::spawn(alerts::watch_argus(
+                alerts.clone(),
+                cfg.alerts.argus_events.clone().into(),
+            ));
         }
         if !cfg.alerts.vortexwall_unit.is_empty() {
-            tokio::spawn(alerts::watch_vortexwall(alerts.clone(), cfg.alerts.vortexwall_unit.clone()));
+            tokio::spawn(alerts::watch_vortexwall(
+                alerts.clone(),
+                cfg.alerts.vortexwall_unit.clone(),
+            ));
         }
     }
-    tokio::spawn(push::run(alerts.clone(), push.clone(), tokens.clone(), cfg.host_label.clone()));
+    tokio::spawn(push::run(
+        alerts.clone(),
+        push.clone(),
+        tokens.clone(),
+        cfg.host_label.clone(),
+        wf.quiet_hours.clone(),
+    ));
 
     let app = Arc::new(api::App {
         host: cfg.host_label.clone(),
@@ -232,6 +342,7 @@ async fn serve(config_path: PathBuf) {
         deck,
         alerts,
         push,
+        webhook_token,
         mission: mission::Mission::new(&cfg.mission),
         brake: api::Brake::default(),
         stopping,
@@ -249,7 +360,10 @@ async fn serve(config_path: PathBuf) {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .unwrap_or_else(|e| die(format!("can't bind {addr}: {e}")));
-    println!("[nightwatchd] {} listening on http://{addr}/v1", cfg.host_label);
+    println!(
+        "[nightwatchd] {} listening on http://{addr}/v1",
+        cfg.host_label
+    );
     let shutdown = async move {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("signal");
