@@ -61,6 +61,10 @@ pub struct Store {
     path: Option<PathBuf>,
     inner: Mutex<VecDeque<Alert>>,
     tx: broadcast::Sender<Alert>,
+    /// Serializes saves. They run after `inner` is released and all share one
+    /// temp file, so two concurrent saves used to race: one renamed the temp
+    /// file away while the other was still writing it ("can't save alerts").
+    saving: Mutex<()>,
 }
 
 pub struct NewAlert<'a> {
@@ -84,6 +88,7 @@ impl Store {
             path: Some(path),
             inner: Mutex::new(list),
             tx: broadcast::channel(64).0,
+            saving: Mutex::new(()),
         }
     }
 
@@ -93,6 +98,7 @@ impl Store {
             path: None,
             inner: Mutex::new(VecDeque::new()),
             tx: broadcast::channel(64).0,
+            saving: Mutex::new(()),
         }
     }
 
@@ -106,6 +112,7 @@ impl Store {
 
     fn save(&self, list: &VecDeque<Alert>) {
         let Some(path) = &self.path else { return };
+        let _one_at_a_time = self.saving.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -185,7 +192,10 @@ impl Store {
     pub fn unacked(&self) -> (usize, usize) {
         let list = self.lock();
         let open = list.iter().filter(|a| !a.acked);
-        let crit = open.clone().filter(|a| a.severity == Severity::Crit).count();
+        let crit = open
+            .clone()
+            .filter(|a| a.severity == Severity::Crit)
+            .count();
         (open.count(), crit)
     }
 
@@ -193,7 +203,10 @@ impl Store {
     pub fn ack(&self, id: Option<u64>) -> usize {
         let mut list = self.lock();
         let mut n = 0;
-        for a in list.iter_mut().filter(|a| !a.acked && id.is_none_or(|i| a.id == i)) {
+        for a in list
+            .iter_mut()
+            .filter(|a| !a.acked && id.is_none_or(|i| a.id == i))
+        {
             a.acked = true;
             n += 1;
         }
@@ -209,8 +222,15 @@ impl Store {
 // ── watchers ───────────────────────────────────────────────────────────
 
 /// DaemonHall: failed units, auto-restarts, and DaemonHall itself.
-pub async fn watch_daemonhall(store: Arc<Store>, dh: Arc<Upstream>, every: Duration) {
-    let mut seen: Option<HashMap<String, (String, u64)>> = None;
+pub async fn watch_daemonhall(
+    store: Arc<Store>,
+    dh: Arc<Upstream>,
+    every: Duration,
+    ignore: Vec<String>,
+) {
+    // Warnflare also catches units that were already failed when we started
+    // and timer-driven oneshots that fail again between two polls.
+    let mut units = warnflare::units::UnitWatch::new(warnflare::units::UnitFilter { ignore });
     let mut misses = 0u32;
     loop {
         match dh.get_json(&["api", "units"], &[]).await {
@@ -226,13 +246,12 @@ pub async fn watch_daemonhall(store: Arc<Store>, dh: Arc<Upstream>, every: Durat
                     });
                 }
                 misses = 0;
-                let now = units_state(&v);
-                if let Some(before) = &seen {
-                    for a in unit_transitions(before, &now) {
-                        store.raise(a);
+                let snapshot = unit_snapshots(&v);
+                if !snapshot.is_empty() {
+                    for ev in units.observe(snapshot) {
+                        raise_event(&store, ev);
                     }
                 }
-                seen = Some(now);
             }
             Err(e) => {
                 misses += 1;
@@ -252,58 +271,89 @@ pub async fn watch_daemonhall(store: Arc<Store>, dh: Arc<Upstream>, every: Durat
     }
 }
 
-/// id → (active_state, n_restarts)
-fn units_state(v: &Value) -> HashMap<String, (String, u64)> {
-    v.get("units")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|u| {
-            Some((
-                u.get("id")?.as_str()?.to_string(),
-                (
-                    u.get("active_state")?.as_str()?.to_string(),
-                    u.get("n_restarts").and_then(Value::as_u64).unwrap_or(0),
-                ),
-            ))
-        })
-        .collect()
-}
-
-fn unit_transitions<'a>(
-    before: &HashMap<String, (String, u64)>,
-    now: &HashMap<String, (String, u64)>,
-) -> Vec<NewAlert<'a>> {
-    let mut out = vec![];
-    for (id, (state, restarts)) in now {
-        let Some((was, was_restarts)) = before.get(id) else { continue };
-        if state == "failed" && was != "failed" {
-            out.push(NewAlert {
-                source: "daemonhall",
-                severity: Severity::Crit,
-                key: format!("unit-failed:{id}"),
-                title: format!("{} failed", short_unit(id)),
-                body: format!("{id} entered the failed state."),
-                subject: id.clone(),
-            });
-        } else if restarts > was_restarts {
-            out.push(NewAlert {
-                source: "daemonhall",
-                severity: Severity::Warn,
-                key: format!("unit-restart:{id}"),
-                title: format!("{} restarted itself", short_unit(id)),
-                body: format!("systemd restarted {id} ({restarts} restarts so far)."),
-                subject: id.clone(),
-            });
+impl From<warnflare::Severity> for Severity {
+    fn from(s: warnflare::Severity) -> Severity {
+        match s {
+            warnflare::Severity::Info => Severity::Info,
+            warnflare::Severity::Warn => Severity::Warn,
+            warnflare::Severity::Crit => Severity::Crit,
         }
     }
-    out.sort_by(|a, b| a.key.cmp(&b.key));
-    out
 }
 
-fn short_unit(id: &str) -> &str {
-    let id = id.strip_prefix("user:").unwrap_or(id);
-    id.strip_suffix(".service").unwrap_or(id)
+/// Store a Warnflare event. Unit events keep the `daemonhall` source the
+/// app already knows; the others use Warnflare's rule family.
+pub fn raise_event(store: &Store, ev: warnflare::Event) -> Option<Alert> {
+    let source = match ev.source.as_str() {
+        "units" => "daemonhall",
+        other => other,
+    };
+    store.raise(NewAlert {
+        source,
+        severity: ev.severity.into(),
+        key: ev.key,
+        title: ev.title,
+        body: ev.body,
+        subject: ev.subject,
+    })
+}
+
+/// DaemonHall's `{"units": [...]}` → Warnflare snapshots.
+fn unit_snapshots(v: &Value) -> Vec<warnflare::units::UnitSnapshot> {
+    v.get("units")
+        .and_then(|u| serde_json::from_value(u.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// Freshness rules: jobs that stop running without failing.
+pub async fn watch_freshness(
+    store: Arc<Store>,
+    rules: Vec<warnflare::freshness::Freshness>,
+    every: Duration,
+) {
+    let home = dirs::home_dir().unwrap_or_default();
+    let mut watch = warnflare::freshness::FreshnessWatch::default();
+    loop {
+        for ev in watch.check(&rules, std::time::SystemTime::now(), &home) {
+            raise_event(&store, ev);
+        }
+        tokio::time::sleep(every).await;
+    }
+}
+
+/// Journal rules over `journalctl -f -o json` (system, or the user manager).
+pub async fn watch_journal(
+    store: Arc<Store>,
+    rules: Arc<warnflare::journal::JournalRules>,
+    user: bool,
+) {
+    use tokio::io::AsyncBufReadExt;
+    loop {
+        let mut cmd = tokio::process::Command::new("journalctl");
+        if user {
+            cmd.arg("--user");
+        }
+        let child = cmd
+            .args(["-f", "-n", "0", "-o", "json"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn();
+        if let Ok(mut child) = child
+            && let Some(out) = child.stdout.take()
+        {
+            let mut lines = tokio::io::BufReader::new(out).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Ok(record) = serde_json::from_str::<Value>(&line) {
+                    for ev in rules.check(&record) {
+                        raise_event(&store, ev);
+                    }
+                }
+            }
+            let _ = child.wait().await;
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
 }
 
 /// Dockspace: a running stack dropping to partial or stopped.
@@ -332,7 +382,10 @@ pub async fn watch_dockspace(store: Arc<Store>, ds: Arc<Upstream>, every: Durati
                             severity: Severity::Warn,
                             key: format!("stack:{name}"),
                             title: format!("Stack {name} is {}", status.to_lowercase()),
-                            body: format!("{name} was running and is now {}.", status.to_lowercase()),
+                            body: format!(
+                                "{name} was running and is now {}.",
+                                status.to_lowercase()
+                            ),
                             subject: name.clone(),
                         });
                     }
@@ -356,7 +409,9 @@ pub async fn watch_argus(store: Arc<Store>, path: PathBuf) {
         if len == offset {
             continue;
         }
-        let Ok(mut f) = std::fs::File::open(&path) else { continue };
+        let Ok(mut f) = std::fs::File::open(&path) else {
+            continue;
+        };
         if f.seek(SeekFrom::Start(offset)).is_err() {
             continue;
         }
@@ -400,7 +455,11 @@ fn argus_alert<'a>(paths: &[String]) -> Option<NewAlert<'a>> {
         key: "argus".into(),
         title,
         body,
-        subject: first.split_once(": ").map(|x| x.1).unwrap_or(first).to_string(),
+        subject: first
+            .split_once(": ")
+            .map(|x| x.1)
+            .unwrap_or(first)
+            .to_string(),
     })
 }
 
@@ -468,15 +527,39 @@ mod tests {
         assert!(s.raise(new("b")).is_some());
         assert_eq!(s.unacked(), (2, 0));
         assert_eq!(s.ack(Some(1)), 1);
-        assert!(s.raise(new("a")).is_some(), "acked alerts don't absorb new ones");
+        assert!(
+            s.raise(new("a")).is_some(),
+            "acked alerts don't absorb new ones"
+        );
         assert_eq!(s.list(Some(2), 10).len(), 1);
         assert_eq!(s.ack(None), 2);
         assert_eq!(s.unacked(), (0, 0));
     }
 
     #[test]
+    fn concurrent_raises_all_reach_disk() {
+        let path =
+            std::env::temp_dir().join(format!("nw-alerts-{}.jsonl", crate::tokens::random_hex(4)));
+        let store = Arc::new(Store::open(path.clone()));
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                let s = store.clone();
+                std::thread::spawn(move || {
+                    s.raise(new(&format!("k{i}")));
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(Store::open(path.clone()).list(None, 100).len(), 16);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn store_survives_a_restart() {
-        let path = std::env::temp_dir().join(format!("nw-alerts-{}.jsonl", crate::tokens::random_hex(4)));
+        let path =
+            std::env::temp_dir().join(format!("nw-alerts-{}.jsonl", crate::tokens::random_hex(4)));
         let s = Store::open(path.clone());
         s.raise(new("x"));
         s.raise(new("y"));
@@ -488,22 +571,35 @@ mod tests {
     }
 
     #[test]
-    fn unit_failures_and_restarts_alert() {
-        let before = units_state(&json!({"units": [
-            {"id": "a.service", "active_state": "active", "n_restarts": 0},
-            {"id": "user:b.service", "active_state": "active", "n_restarts": 1},
-            {"id": "c.service", "active_state": "failed", "n_restarts": 0},
-        ]}));
-        let now = units_state(&json!({"units": [
-            {"id": "a.service", "active_state": "failed", "n_restarts": 0},
-            {"id": "user:b.service", "active_state": "active", "n_restarts": 2},
-            {"id": "c.service", "active_state": "failed", "n_restarts": 0},
-            {"id": "new.service", "active_state": "failed", "n_restarts": 0},
-        ]}));
-        let alerts = unit_transitions(&before, &now);
-        let titles: Vec<&str> = alerts.iter().map(|a| a.title.as_str()).collect();
-        assert_eq!(titles, vec!["a failed", "b restarted itself"]);
-        assert_eq!(alerts[0].severity, Severity::Crit);
+    fn unit_failures_go_through_warnflare() {
+        let store = Store::memory();
+        let mut w = warnflare::units::UnitWatch::default();
+        let snap = |v: Value| unit_snapshots(&v);
+        // Already failed at the first poll: reported (the old watcher stayed silent).
+        for ev in w.observe(snap(json!({"units": [
+            {"id": "sigilward-check.service", "kind": "service", "active_state": "failed", "result": "exit-code", "triggered_by": ["sigilward-check.timer"]},
+            {"id": "sigilward-check.timer", "kind": "timer", "active_state": "active", "last_run": 100},
+            {"id": "user:b.service", "kind": "service", "active_state": "active", "n_restarts": 1},
+        ]}))) {
+            raise_event(&store, ev);
+        }
+        // Its timer ran again and it failed again; b restarted.
+        for ev in w.observe(snap(json!({"units": [
+            {"id": "sigilward-check.service", "kind": "service", "active_state": "failed", "result": "exit-code", "triggered_by": ["sigilward-check.timer"]},
+            {"id": "sigilward-check.timer", "kind": "timer", "active_state": "active", "last_run": 86500},
+            {"id": "user:b.service", "kind": "service", "active_state": "active", "n_restarts": 2},
+        ]}))) {
+            raise_event(&store, ev);
+        }
+        let list = store.list(None, 10);
+        let titles: Vec<&str> = list.iter().map(|a| a.title.as_str()).collect();
+        // Newest first.
+        assert_eq!(titles, ["b restarted itself", "sigilward-check is failed"]);
+        // "failed again" reused the same key inside the fold window, so it folded.
+        let sigil = &list[1];
+        assert_eq!(sigil.count, 2);
+        assert_eq!(sigil.source, "daemonhall");
+        assert_eq!(sigil.severity, Severity::Crit);
     }
 
     #[test]

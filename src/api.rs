@@ -37,6 +37,8 @@ pub struct App {
     pub deck: Upstream,
     pub alerts: Arc<Alerts>,
     pub push: Arc<Registry>,
+    /// Bearer token for `POST /v1/events` (Warnflare webhook); None = off.
+    pub webhook_token: Option<String>,
     pub mission: Mission,
     pub brake: Brake,
     /// Flips to true on shutdown so open log streams end.
@@ -69,7 +71,10 @@ pub fn router(app: Shared) -> Router {
         // Alerts and push
         .route("/v1/alerts", get(alerts))
         .route("/v1/alerts/ack", post(alerts_ack))
-        .route("/v1/push", get(push_get).post(push_register).delete(push_unregister))
+        .route(
+            "/v1/push",
+            get(push_get).post(push_register).delete(push_unregister),
+        )
         .route("/v1/push/test", post(push_test))
         // Mission Control
         .route("/v1/mission", get(mission_project))
@@ -78,7 +83,58 @@ pub fn router(app: Shared) -> Router {
         .route("/v1/mission/audit", get(mission_audit))
         .fallback(|| async { err(StatusCode::NOT_FOUND, "no such endpoint") })
         .layer(middleware::from_fn_with_state(app.clone(), auth))
-        .with_state(app)
+        .with_state(app.clone())
+        // Outside the device-token layer: scripts and backups authenticate
+        // with the separate Warnflare webhook token instead.
+        .merge(
+            Router::new()
+                .route("/v1/events", post(events_ingest))
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    warnflare::webhook::MAX_BODY_BYTES,
+                ))
+                .with_state(app),
+        )
+}
+
+/// `POST /v1/events`: a Warnflare webhook event from a local script, backup
+/// job or CI. Uses its own token, never a device token.
+async fn events_ingest(
+    State(app): State<Shared>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some(expected) = &app.webhook_token else {
+        return err(StatusCode::NOT_FOUND, "the event webhook is not configured");
+    };
+    let now = crate::tokens::now();
+    if app.brake.blocked(now) {
+        return err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many bad tokens; wait a minute",
+        );
+    }
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim);
+    use warnflare::webhook::Rejected;
+    match warnflare::webhook::accept(expected, presented, &body) {
+        Ok(ev) => {
+            let id = crate::alerts::raise_event(&app.alerts, ev).map(|a| a.id);
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({ "ok": true, "id": id, "folded": id.is_none() })),
+            )
+                .into_response()
+        }
+        Err(Rejected::Unauthorized) => {
+            app.brake.fail(now);
+            err(StatusCode::UNAUTHORIZED, "missing or wrong webhook token")
+        }
+        Err(Rejected::TooLarge) => err(StatusCode::PAYLOAD_TOO_LARGE, "event body too large"),
+        Err(Rejected::Invalid(why)) => err(StatusCode::BAD_REQUEST, &why),
+    }
 }
 
 // ── auth ───────────────────────────────────────────────────────────────
@@ -93,7 +149,8 @@ pub struct Brake {
 
 impl Brake {
     fn blocked(&self, now: u64) -> bool {
-        self.window.load(Ordering::Relaxed) == now / 60 && self.failures.load(Ordering::Relaxed) >= 20
+        self.window.load(Ordering::Relaxed) == now / 60
+            && self.failures.load(Ordering::Relaxed) >= 20
     }
 
     fn fail(&self, now: u64) {
@@ -108,7 +165,10 @@ impl Brake {
 async fn auth(State(app): State<Shared>, mut req: Request, next: Next) -> Response {
     let now = crate::tokens::now();
     if app.brake.blocked(now) {
-        return err(StatusCode::TOO_MANY_REQUESTS, "too many bad tokens; wait a minute");
+        return err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many bad tokens; wait a minute",
+        );
     }
     let grant = req
         .headers()
@@ -124,7 +184,10 @@ async fn auth(State(app): State<Shared>, mut req: Request, next: Next) -> Respon
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    h.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
     h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     resp
 }
@@ -138,7 +201,11 @@ fn operate(g: &Grant) -> Result<(), Response> {
 }
 
 fn err(status: StatusCode, message: impl Into<String>) -> Response {
-    (status, Json(json!({ "ok": false, "message": message.into() }))).into_response()
+    (
+        status,
+        Json(json!({ "ok": false, "message": message.into() })),
+    )
+        .into_response()
 }
 
 fn up_err(e: UpError) -> Response {
@@ -216,10 +283,20 @@ async fn units(State(app): State<Shared>) -> Response {
 
 /// Adds `nw_actions` (what the phone may do) and `nw_protected`.
 fn annotate_unit(policy: &Policy, u: &mut Value) {
-    let id = u.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
-    let controllable = u.get("controllable").and_then(Value::as_bool).unwrap_or(false);
+    let id = u
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let controllable = u
+        .get("controllable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if let Some(o) = u.as_object_mut() {
-        o.insert("nw_actions".into(), json!(policy.unit_verbs(&id, controllable)));
+        o.insert(
+            "nw_actions".into(),
+            json!(policy.unit_verbs(&id, controllable)),
+        );
         o.insert("nw_protected".into(), json!(policy.is_protected(&id)));
     }
 }
@@ -247,13 +324,24 @@ struct LinesQ {
 }
 
 /// Live journal lines as server-sent events, straight from DaemonHall.
-async fn unit_logs(State(app): State<Shared>, Path(id): Path<String>, Query(q): Query<LinesQ>) -> Response {
+async fn unit_logs(
+    State(app): State<Shared>,
+    Path(id): Path<String>,
+    Query(q): Query<LinesQ>,
+) -> Response {
     let lines = q.lines.unwrap_or(200).min(2000).to_string();
-    let url = match app.dh_stream.url(&["api", "logs"], &[("unit", id), ("lines", lines)]) {
+    let url = match app
+        .dh_stream
+        .url(&["api", "logs"], &[("unit", id), ("lines", lines)])
+    {
         Ok(u) => u,
         Err(e) => return up_err(e),
     };
-    let resp = match app.dh_stream.send(reqwest::Method::GET, url, None, None).await {
+    let resp = match app
+        .dh_stream
+        .send(reqwest::Method::GET, url, None, None)
+        .await
+    {
         Ok(r) => r,
         Err(e) => return up_err(e),
     };
@@ -337,7 +425,8 @@ async fn stack_action(
     // Dockspace answers with an HTML card and runs the action in the
     // background; the phone re-reads /v1/stacks for the outcome.
     match app.ds.post(&["stacks", &id, &verb], None, &g.actor()).await {
-        Ok(_) => Json(json!({ "ok": true, "message": format!("{verb} started for {id}") })).into_response(),
+        Ok(_) => Json(json!({ "ok": true, "message": format!("{verb} started for {id}") }))
+            .into_response(),
         Err(e) => up_err(e),
     }
 }
@@ -345,7 +434,11 @@ async fn stack_action(
 /// Only containers that belong to a stack Dockspace scans may be touched,
 /// not any container on the host.
 async fn known_container(app: &App, name: &str) -> Result<(), Response> {
-    let v = app.ds.get_json(&["api", "stacks"], &[]).await.map_err(up_err)?;
+    let v = app
+        .ds
+        .get_json(&["api", "stacks"], &[])
+        .await
+        .map_err(up_err)?;
     let found = v
         .get("stacks")
         .and_then(Value::as_array)
@@ -357,7 +450,10 @@ async fn known_container(app: &App, name: &str) -> Result<(), Response> {
     if found {
         Ok(())
     } else {
-        Err(err(StatusCode::NOT_FOUND, format!("{name} is not a container of a Dockspace stack")))
+        Err(err(
+            StatusCode::NOT_FOUND,
+            format!("{name} is not a container of a Dockspace stack"),
+        ))
     }
 }
 
@@ -365,7 +461,11 @@ async fn container_logs(State(app): State<Shared>, Path(name): Path<String>) -> 
     if let Err(r) = known_container(&app, &name).await {
         return r;
     }
-    reply(app.ds.get_json(&["api", "container", &name, "logs"], &[]).await)
+    reply(
+        app.ds
+            .get_json(&["api", "container", &name, "logs"], &[])
+            .await,
+    )
 }
 
 async fn container_action(
@@ -382,7 +482,11 @@ async fn container_action(
     if let Err(r) = known_container(&app, &name).await {
         return r;
     }
-    reply(app.ds.post(&["api", "container", &name, &verb], None, &g.actor()).await)
+    reply(
+        app.ds
+            .post(&["api", "container", &name, &verb], None, &g.actor())
+            .await,
+    )
 }
 
 // ── Cyberdeck-hub ──────────────────────────────────────────────────────
@@ -392,7 +496,10 @@ async fn deck_reports(State(app): State<Shared>) -> Response {
 }
 
 async fn deck_report(State(app): State<Shared>, Path(path): Path<String>) -> Response {
-    if path.split('/').any(|s| s.is_empty() || s == ".." || s == ".") {
+    if path
+        .split('/')
+        .any(|s| s.is_empty() || s == ".." || s == ".")
+    {
         return err(StatusCode::BAD_REQUEST, "invalid report path");
     }
     let mut segs = vec!["api", "reports-md"];
@@ -419,7 +526,11 @@ async fn deck_scan(
         return err(StatusCode::NOT_FOUND, format!("no scan called {module:?}"));
     };
     let body = json!({ cmd: "./diagnostics" });
-    match app.deck.post(&["cyberdeck", "api", "command"], Some(&body), &g.actor()).await {
+    match app
+        .deck
+        .post(&["cyberdeck", "api", "command"], Some(&body), &g.actor())
+        .await
+    {
         Ok(v) => Json(json!({ "ok": true, "message": v })).into_response(),
         Err(e) => up_err(e),
     }
@@ -471,7 +582,11 @@ struct PushBody {
 
 /// Any token may register its own phone; it only ever receives alerts it
 /// could read anyway.
-async fn push_register(State(app): State<Shared>, Extension(g): Extension<Grant>, Json(b): Json<PushBody>) -> Response {
+async fn push_register(
+    State(app): State<Shared>,
+    Extension(g): Extension<Grant>,
+    Json(b): Json<PushBody>,
+) -> Response {
     match app.push.register(&g.id, b.endpoint.trim()) {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
         Err(m) => err(StatusCode::UNPROCESSABLE_ENTITY, m),
@@ -514,8 +629,14 @@ mod tests {
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt;
 
+    const HOOK: &str = "wf_test_0123456789abcdefghij";
+
     /// A gateway whose services all point at a dead port.
     fn app(tokens: Arc<Tokens>) -> Router {
+        app_with(tokens, Some(HOOK.into()))
+    }
+
+    fn app_with(tokens: Arc<Tokens>, webhook_token: Option<String>) -> Router {
         let dead = config::Upstream {
             enabled: true,
             url: "http://127.0.0.1:9".into(),
@@ -534,26 +655,105 @@ mod tests {
             deck: Upstream::new("cyberdeck", &dead, t),
             alerts: Arc::new(Alerts::memory()),
             push: Arc::new(Registry::memory(vec!["ntfy.test".into()])),
+            webhook_token,
             mission: Mission::new(&config::Mission::default()),
             brake: Brake::default(),
             stopping: rx,
         }))
     }
 
-    async fn call(r: &Router, method: &str, path: &str, token: Option<&str>, body: Option<Value>) -> (StatusCode, Value) {
+    async fn call(
+        r: &Router,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
         let mut b = HttpRequest::builder().method(method).uri(path);
         if let Some(t) = token {
             b = b.header("authorization", format!("Bearer {t}"));
         }
         let req = match body {
-            Some(v) => b.header("content-type", "application/json").body(Body::from(v.to_string())),
+            Some(v) => b
+                .header("content-type", "application/json")
+                .body(Body::from(v.to_string())),
             None => b.body(Body::empty()),
         }
         .unwrap();
         let resp = r.clone().oneshot(req).await.unwrap();
         let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn webhook_events_use_their_own_token() {
+        let tokens = Arc::new(Tokens::memory());
+        let (_, device) = tokens.create("phone", true).unwrap();
+        let r = app(tokens.clone());
+        let ev = json!({"source": "gravevault", "severity": "crit", "key": "restore-drill", "title": "Restore drill failed"});
+
+        let (st, v) = call(&r, "POST", "/v1/events", Some(HOOK), Some(ev.clone())).await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+        assert_eq!(v["folded"], false);
+        let (st, v) = call(&r, "POST", "/v1/events", Some(HOOK), Some(ev.clone())).await;
+        assert_eq!(
+            (st, &v["folded"]),
+            (StatusCode::ACCEPTED, &json!(true)),
+            "a repeat folds"
+        );
+
+        // A device token is not a webhook token, and vice versa.
+        assert_eq!(
+            call(&r, "POST", "/v1/events", Some(&device), Some(ev.clone()))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(&r, "POST", "/v1/events", None, Some(ev.clone()))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(&r, "GET", "/v1/alerts", Some(HOOK), None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // The event shows up for the phone.
+        let (st, v) = call(&r, "GET", "/v1/alerts", Some(&device), None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(v.to_string().contains("Restore drill failed"), "{v}");
+
+        let bad = json!({"source": "x y", "severity": "info", "key": "k", "title": "t"});
+        assert_eq!(
+            call(&r, "POST", "/v1/events", Some(HOOK), Some(bad))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        let huge = json!({"source": "x", "severity": "info", "key": "k", "title": "t", "body": "a".repeat(20_000)});
+        assert_eq!(
+            call(&r, "POST", "/v1/events", Some(HOOK), Some(huge))
+                .await
+                .0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        // Not configured: the endpoint doesn't exist.
+        let off = app_with(tokens, None);
+        assert_eq!(
+            call(&off, "POST", "/v1/events", Some(HOOK), Some(ev))
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]
@@ -563,24 +763,64 @@ mod tests {
         let (_, op) = tokens.create("operator", true).unwrap();
         let r = app(tokens);
 
-        assert_eq!(call(&r, "GET", "/v1/session", None, None).await.0, StatusCode::UNAUTHORIZED);
-        assert_eq!(call(&r, "GET", "/v1/session", Some("nw_x_y"), None).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            call(&r, "GET", "/v1/session", None, None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(&r, "GET", "/v1/session", Some("nw_x_y"), None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
         let (s, v) = call(&r, "GET", "/v1/session", Some(&read), None).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(v["device"]["operate"], false);
         assert_eq!(v["services"]["daemonhall"], false);
 
         // Read tokens can't act; operate tokens pass the policy first.
-        let (s, v) = call(&r, "POST", "/v1/units/dockspace.service/action/restart", Some(&read), None).await;
-        assert_eq!((s, v["message"].as_str()), (StatusCode::FORBIDDEN, Some("this device token is read-only")));
-        let (s, _) = call(&r, "POST", "/v1/units/tailscaled.service/action/stop", Some(&op), None).await;
+        let (s, v) = call(
+            &r,
+            "POST",
+            "/v1/units/dockspace.service/action/restart",
+            Some(&read),
+            None,
+        )
+        .await;
+        assert_eq!(
+            (s, v["message"].as_str()),
+            (
+                StatusCode::FORBIDDEN,
+                Some("this device token is read-only")
+            )
+        );
+        let (s, _) = call(
+            &r,
+            "POST",
+            "/v1/units/tailscaled.service/action/stop",
+            Some(&op),
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::FORBIDDEN);
-        let (s, _) = call(&r, "POST", "/v1/units/dockspace.service/action/enable", Some(&op), None).await;
+        let (s, _) = call(
+            &r,
+            "POST",
+            "/v1/units/dockspace.service/action/enable",
+            Some(&op),
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::FORBIDDEN);
         let (s, _) = call(&r, "POST", "/v1/stacks/web/action/down", Some(&op), None).await;
         assert_eq!(s, StatusCode::FORBIDDEN);
         // Allowed by policy, so it reaches the (dead) service.
-        let (s, v) = call(&r, "POST", "/v1/units/dockspace.service/action/restart", Some(&op), None).await;
+        let (s, v) = call(
+            &r,
+            "POST",
+            "/v1/units/dockspace.service/action/restart",
+            Some(&op),
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::BAD_GATEWAY);
         assert!(v["message"].as_str().unwrap().contains("not answering"));
         let (s, _) = call(&r, "POST", "/v1/deck/scans/ArchiveFiles", Some(&op), None).await;
@@ -596,12 +836,25 @@ mod tests {
         let r = app(tokens);
         let (s, v) = call(&r, "GET", "/v1/alerts", Some(&read), None).await;
         assert_eq!((s, v["open"].as_u64()), (StatusCode::OK, Some(0)));
-        assert_eq!(call(&r, "POST", "/v1/alerts/ack", Some(&read), None).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            call(&r, "POST", "/v1/alerts/ack", Some(&read), None)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
 
         let bad = json!({ "endpoint": "http://127.0.0.1:8767/api/daemon-reload" });
-        assert_eq!(call(&r, "POST", "/v1/push", Some(&read), Some(bad)).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            call(&r, "POST", "/v1/push", Some(&read), Some(bad)).await.0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
         let good = json!({ "endpoint": "https://ntfy.test/upABC?up=1" });
-        assert_eq!(call(&r, "POST", "/v1/push", Some(&read), Some(good)).await.0, StatusCode::OK);
+        assert_eq!(
+            call(&r, "POST", "/v1/push", Some(&read), Some(good))
+                .await
+                .0,
+            StatusCode::OK
+        );
         let (_, v) = call(&r, "GET", "/v1/push", Some(&read), None).await;
         assert_eq!(v["endpoint"], "https://ntfy.test/upABC?up=1");
         // ntfy.test doesn't resolve: the test push reports the failure.

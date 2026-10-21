@@ -55,11 +55,15 @@ impl Mission {
     }
 
     pub fn url_for(&self, view: &View) -> Result<reqwest::Url, UpError> {
-        let mut url = reqwest::Url::parse(&self.cfg.url)
-            .map_err(|e| UpError::Unreachable("mission control", format!("bad url in config: {e}")))?;
+        let mut url = reqwest::Url::parse(&self.cfg.url).map_err(|e| {
+            UpError::Unreachable("mission control", format!("bad url in config: {e}"))
+        })?;
         let loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
         if url.scheme() != "https" && !loopback {
-            return Err(UpError::Unreachable("mission control", "url must be https".into()));
+            return Err(UpError::Unreachable(
+                "mission control",
+                "url must be https".into(),
+            ));
         }
         let mut segs = vec!["api", "projects", self.cfg.project.as_str()];
         match view {
@@ -88,7 +92,9 @@ impl Mission {
             read(&self.cfg.access_client_id_file),
             read(&self.cfg.access_client_secret_file),
         ) {
-            rb = rb.header("CF-Access-Client-Id", id).header("CF-Access-Client-Secret", secret);
+            rb = rb
+                .header("CF-Access-Client-Id", id)
+                .header("CF-Access-Client-Secret", secret);
         }
         let resp = rb
             .send()
@@ -131,7 +137,10 @@ mod tests {
     #[test]
     fn urls_are_fixed_and_encoded() {
         let x = m("https://mc.example/");
-        assert_eq!(x.url_for(&View::Agents).unwrap().as_str(), "https://mc.example/api/projects/proj_1/agents");
+        assert_eq!(
+            x.url_for(&View::Agents).unwrap().as_str(),
+            "https://mc.example/api/projects/proj_1/agents"
+        );
         assert_eq!(
             x.url_for(&View::Heartbeats("a/../../x")).unwrap().as_str(),
             "https://mc.example/api/projects/proj_1/agents/a%2F..%2F..%2Fx/heartbeats"
